@@ -9,6 +9,7 @@
 
 import { createWorld, update } from "./world";
 import { fitViewport, render, type Viewport } from "./render";
+import { createInput } from "./input";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#stage");
 if (!canvas) throw new Error("#stage canvas is missing from index.html");
@@ -17,6 +18,7 @@ const ctx = canvas.getContext("2d");
 if (!ctx) throw new Error("2d canvas context unavailable");
 
 const world = createWorld();
+const input = createInput();
 let view: Viewport = fitViewport(canvas);
 
 function onResize(): void {
@@ -43,7 +45,7 @@ function frame(now: number): void {
   last = now;
 
   while (accumulator >= STEP_MS) {
-    update(world, STEP_MS / 1000);
+    update(world, input, STEP_MS / 1000);
     accumulator -= STEP_MS;
   }
 
