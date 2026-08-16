@@ -73,16 +73,23 @@ export function render(
     );
   }
 
+  // Each bunker is drawn from its own damage cache, so holes and gnawed edges
+  // show where earlier shots and bombs struck. The cache is updated in place
+  // by `erodeShield`; here it is a single blit per bunker.
   for (const shield of world.shields) {
-    ctx.drawImage(SPRITES.shield.canvas, Math.round(shield.x), shield.y);
+    ctx.drawImage(shield.canvas, Math.round(shield.x), shield.y);
   }
 
+  // The cannon is hidden once the run ends on a lost last life — it was just
+  // blown up. A formation-reach game over still shows it, frozen in place.
   const cannon = SPRITES.cannon;
-  ctx.drawImage(
-    cannon.canvas,
-    Math.round(world.cannon.x - cannon.w / 2),
-    world.cannon.y,
-  );
+  if (!world.gameOver || world.lives > 0) {
+    ctx.drawImage(
+      cannon.canvas,
+      Math.round(world.cannon.x - cannon.w / 2),
+      world.cannon.y,
+    );
+  }
 
   // The in-flight player shot — a thin white bolt, drawn as a filled rect.
   if (world.shot) {
@@ -93,6 +100,26 @@ export function render(
       SHOT_W,
       SHOT_H,
     );
+  }
+
+  // Alien bombs in flight — amber zigzag bolts, one blit each.
+  const bombSprite = SPRITES.bomb;
+  for (const bomb of world.bombs) {
+    ctx.drawImage(
+      bombSprite.canvas,
+      Math.round(bomb.x - bombSprite.w / 2),
+      Math.round(bomb.y),
+    );
+  }
+
+  // Spare lives, drawn as little cannon icons in the bottom border below the
+  // ground line, the way the arcade's cabinet did. The current life is the
+  // cannon above, so only `lives - 1` spares are shown (clamped at zero once
+  // the run is over). Bombs vanish at the ground line, so they never overlap
+  // these icons on the way down.
+  const spares = Math.max(0, world.lives - 1);
+  for (let i = 0; i < spares; i++) {
+    ctx.drawImage(cannon.canvas, 8 + i * (cannon.w + 4), WORLD_H - cannon.h - 2);
   }
 
   // The ground line under the cannon.
