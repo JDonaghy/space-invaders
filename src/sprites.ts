@@ -37,6 +37,10 @@ function prerender(rows: readonly string[], color: string): Sprite {
 // invaders, green shields and cannon near the bottom of the screen.
 const INVADER = "#ffffff";
 const GREEN = "#33ff33";
+// Alien bombs are amber so incoming fire reads as distinct from the white
+// player shot and the green shields/cannon, not because the arcade was amber
+// (it was green) — clarity on a dark background wins here.
+const BOMB_COLOR = "#ffcc44";
 
 /** Top row alien — the small "squid", 8×8. */
 const SQUID = [
@@ -86,8 +90,11 @@ const CANNON = [
   "#############",
 ];
 
-/** A shield bunker, 22×16, with the arched notch cut from the underside. */
-const SHIELD = [
+/** A shield bunker, 22×16, with the arched notch cut from the underside.
+ *  Exported so the world can seed each bunker's per-cell damage mask from the
+ *  same grid the sprite was pre-rendered from — collision truth and render
+ *  cache stay in sync that way. */
+export const SHIELD = [
   "....##############....",
   "...################...",
   "..##################..",
@@ -106,6 +113,17 @@ const SHIELD = [
   "#####............#####",
 ];
 
+/** An alien bomb, 3×5 — a small zigzag bolt, the way the arcade's "rolling"
+ *  bomb wiggled as it fell. Kept tiny so a single hit erodes a small chunk of
+ *  a bunker rather than punching a doorway. */
+const BOMB = [
+  "##.",
+  ".##",
+  "##.",
+  ".##",
+  "##.",
+];
+
 /** All sprites, pre-rendered once at module load. */
 export const SPRITES = {
   squid: prerender(SQUID, INVADER),
@@ -113,6 +131,7 @@ export const SPRITES = {
   octopus: prerender(OCTOPUS, INVADER),
   cannon: prerender(CANNON, GREEN),
   shield: prerender(SHIELD, GREEN),
+  bomb: prerender(BOMB, BOMB_COLOR),
 } as const;
 
 export type SpriteName = keyof typeof SPRITES;
