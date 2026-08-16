@@ -4,7 +4,7 @@
  */
 
 import { SPRITES } from "./sprites";
-import { WORLD_W, WORLD_H, type World } from "./world";
+import { WORLD_W, WORLD_H, SHOT_W, SHOT_H, type World } from "./world";
 
 export interface Viewport {
   /** Device-pixel size of the canvas backing store. */
@@ -83,6 +83,17 @@ export function render(
     Math.round(world.cannon.x - cannon.w / 2),
     world.cannon.y,
   );
+
+  // The in-flight player shot — a thin white bolt, drawn as a filled rect.
+  if (world.shot) {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(
+      Math.round(world.shot.x - SHOT_W / 2),
+      Math.round(world.shot.y),
+      SHOT_W,
+      SHOT_H,
+    );
+  }
 
   // The ground line under the cannon.
   ctx.fillStyle = "#33ff33";
