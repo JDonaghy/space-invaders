@@ -41,6 +41,8 @@ const GREEN = "#33ff33";
 // player shot and the green shields/cannon, not because the arcade was amber
 // (it was green) — clarity on a dark background wins here.
 const BOMB_COLOR = "#ffcc44";
+// The mystery ship (UFO) wore a red cellophane strip on the cabinet.
+const UFO_COLOR = "#ff3333";
 
 /** Top row alien — the small "squid", 8×8. */
 const SQUID = [
@@ -124,6 +126,18 @@ const BOMB = [
   "##.",
 ];
 
+/** The mystery ship (UFO) that occasionally crosses the top of the field for a
+ *  bonus. 16×6 — wider than any invader so it reads as a different thing, with
+ *  a row of "lights" along the underside. */
+const UFO = [
+  "....########....",
+  "..############..",
+  ".####..##..####.",
+  "################",
+  ".##.##.##.##.##.",
+  "..##........##..",
+];
+
 /** All sprites, pre-rendered once at module load. */
 export const SPRITES = {
   squid: prerender(SQUID, INVADER),
@@ -132,6 +146,7 @@ export const SPRITES = {
   cannon: prerender(CANNON, GREEN),
   shield: prerender(SHIELD, GREEN),
   bomb: prerender(BOMB, BOMB_COLOR),
+  ufo: prerender(UFO, UFO_COLOR),
 } as const;
 
 export type SpriteName = keyof typeof SPRITES;

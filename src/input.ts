@@ -1,17 +1,39 @@
 /**
- * Input: held movement state plus an edge-triggered fire request.
+ * Input: held movement state plus edge-triggered fire, pause, and mute
+ * requests.
  *
  * Both the keyboard and the touch paths feed the same `InputState`, so the
  * fixed-timestep `update` samples one source of truth — it never reads raw
  * events, and the event listeners here never mutate the world directly. The
- * update consumes fire each step; movement is sampled as held booleans.
+ * update consumes fire each step; movement is sampled as held booleans. Pause
+ * and mute are edges too, but they are consumed by the entry point (not the
+ * update) so they still work while the world is frozen on the title, pause or
+ * game-over screen.
  */
+
+/** A tappable on-canvas button region, in CSS pixels. The entry point
+ *  computes these from the rendered button positions and pushes them here so
+ *  a touch landing on a button toggles pause/mute instead of moving/firing. */
+export interface ButtonRect {
+  id: "pause" | "mute";
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
 
 export interface InputState {
   left: boolean;
   right: boolean;
   /** Edge-triggered fire request. The update reads and clears it each step. */
   fireQueued: boolean;
+  /** Edge-triggered pause request. Consumed by the entry point each frame. */
+  pauseQueued: boolean;
+  /** Edge-triggered mute request. Consumed by the entry point each frame. */
+  muteQueued: boolean;
+  /** Current on-canvas button hit regions in CSS pixels, kept in sync on
+   *  resize by the entry point. Touched by the touch path only. */
+  buttonRects: ButtonRect[];
 }
 
 /** Read and clear the fire request. Returns true if fire was requested. */
@@ -21,9 +43,30 @@ export function consumeFire(s: InputState): boolean {
   return q;
 }
 
+/** Read and clear the pause request. Returns true if pause was toggled. */
+export function consumePause(s: InputState): boolean {
+  const q = s.pauseQueued;
+  s.pauseQueued = false;
+  return q;
+}
+
+/** Read and clear the mute request. Returns true if mute was toggled. */
+export function consumeMute(s: InputState): boolean {
+  const q = s.muteQueued;
+  s.muteQueued = false;
+  return q;
+}
+
 /** Build the input state and attach keyboard + touch listeners to the window. */
 export function createInput(): InputState {
-  const state: InputState = { left: false, right: false, fireQueued: false };
+  const state: InputState = {
+    left: false,
+    right: false,
+    fireQueued: false,
+    pauseQueued: false,
+    muteQueued: false,
+    buttonRects: [],
+  };
   attachKeyboard(state);
   attachTouch(state);
   return state;
@@ -46,6 +89,14 @@ function attachKeyboard(s: InputState): void {
         if (!e.repeat) s.fireQueued = true;
         e.preventDefault();
         break;
+      case "KeyP":
+        if (!e.repeat) s.pauseQueued = true;
+        e.preventDefault();
+        break;
+      case "KeyM":
+        if (!e.repeat) s.muteQueued = true;
+        e.preventDefault();
+        break;
     }
   };
   const onKeyUp = (e: KeyboardEvent) => {
@@ -59,6 +110,8 @@ function attachKeyboard(s: InputState): void {
         e.preventDefault();
         break;
       case "Space":
+      case "KeyP":
+      case "KeyM":
         e.preventDefault();
         break;
     }
@@ -83,6 +136,9 @@ interface TouchRec {
   /** True once the hold delay elapsed — this touch counts as a move, not a tap. */
   armed: boolean;
   timeout: number;
+  /** Set when the touch began inside a pause/mute button region: it toggles
+   *  that control on release (a button tap) and never moves or fires. */
+  button: "pause" | "mute" | null;
 }
 
 /**
@@ -94,17 +150,25 @@ const HOLD_DELAY_MS = 120;
 /** Distance a touch may wander and still count as a tap, in CSS pixels. */
 const TAP_SLACK_PX = 12;
 
+/** Return the button whose region contains `(x, y)`, or null. */
+function buttonAt(s: InputState, x: number, y: number): ButtonRect | null {
+  for (const r of s.buttonRects) {
+    if (x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1) return r;
+  }
+  return null;
+}
+
 function attachTouch(s: InputState): void {
   const active = new Map<number, TouchRec>();
 
   // Recompute held sides from every active, armed touch. A tap that never
   // armed contributes no movement; a still-pressed finger on the other side
-  // keeps its direction.
+  // keeps its direction. Button touches never contribute movement.
   const applyHeldSides = () => {
     let left = false;
     let right = false;
     for (const r of active.values()) {
-      if (!r.armed) continue;
+      if (!r.armed || r.button) continue;
       if (r.side === "left") left = true;
       else right = true;
     }
@@ -115,16 +179,20 @@ function attachTouch(s: InputState): void {
   const onTouchStart = (e: TouchEvent) => {
     const half = window.innerWidth / 2;
     for (const t of e.changedTouches) {
-      const side: "left" | "right" = t.clientX < half ? "left" : "right";
+      // A touch that begins on a pause/mute button toggles it (on release) and
+      // is otherwise inert — it neither moves the cannon nor fires.
+      const btn = buttonAt(s, t.clientX, t.clientY);
       const rec: TouchRec = {
-        side,
+        side: btn ? "left" : t.clientX < half ? "left" : "right",
         startX: t.clientX,
         startY: t.clientY,
         moved: false,
         armed: false,
         timeout: 0,
+        button: btn ? btn.id : null,
       };
       rec.timeout = window.setTimeout(() => {
+        if (rec.button) return; // buttons never arm as holds
         rec.armed = true;
         applyHeldSides();
       }, HOLD_DELAY_MS);
@@ -152,8 +220,14 @@ function attachTouch(s: InputState): void {
       const rec = active.get(t.identifier);
       if (!rec) continue;
       clearTimeout(rec.timeout);
-      // A tap is a touch that never armed (short) and never dragged.
-      if (!rec.armed && !rec.moved) {
+      if (rec.button) {
+        // A button tap is a touch that never dragged off the button.
+        if (!rec.moved) {
+          if (rec.button === "pause") s.pauseQueued = true;
+          else s.muteQueued = true;
+        }
+      } else if (!rec.armed && !rec.moved) {
+        // A play-area tap is a touch that never armed (short) and never dragged.
         s.fireQueued = true;
       }
       active.delete(t.identifier);

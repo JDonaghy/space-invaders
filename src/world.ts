@@ -118,8 +118,47 @@ const TICKS_MAX_FLOOR = 20;
 /** Each cleared wave restarts this many pixels lower than the last. */
 const WAVE_DROP_PX = 12;
 /** ...and the starting top is capped after this many waves of lowering, so a
- * late wave does not begin already touching the cannon. */
+ *  late wave does not begin already touching the cannon. */
 const MAX_WAVE_DROP = 4;
+
+// --- Score ----------------------------------------------------------------
+
+/** The type-restricted set of alien sprite kinds, for the score table. */
+type AlienKind = "squid" | "crab" | "octopus";
+
+/**
+ * Points awarded for destroying an alien, keyed by sprite kind. The formation
+ * rows run squid → crab → crab → octopus → octopus from the top down, so this
+ * table is also the per-row table the issue brief specifies: 30 / 20 / 10 from
+ * the top. Pure data so the tempo/score curves can be exercised directly.
+ */
+const SCORE_BY_KIND: Record<AlienKind, number> = {
+  squid: 30,
+  crab: 20,
+  octopus: 10,
+};
+
+/** Bonus awards the mystery ship may carry. The arcade randomised among these;
+ *  the pick is made when the ship appears and banked when it is shot down. */
+const MYSTERY_BONUSES = [50, 100, 150, 300];
+
+/** `localStorage` key for the persisted best score. */
+const BEST_KEY = "space-invaders:best";
+
+// --- Mystery ship ---------------------------------------------------------
+
+/** Y of the mystery ship's top edge — above the formation, below the HUD. */
+const MYSTERY_Y = 24;
+/** Mystery-ship horizontal speed, in world pixels per second. Slow and
+ *  deliberate so the player has time to read it and take the shot. */
+const MYSTERY_SPEED = 80;
+/** Ticks between mystery-ship appearances at a full, idle field — ~25 s. The
+ *  ship only reappears this long after the last one left or was shot down. */
+const MYSTERY_INTERVAL = 1500;
+/** ±jitter on the interval so the appearance is not metronomic. */
+const MYSTERY_JITTER = 300;
+/** Margin past the side wall at which a crossing ship is despawned. */
+const MYSTERY_OFF_MARGIN = 8;
 
 /**
  * March-step interval in ticks, for `alive` remaining aliens on `wave`.
@@ -181,6 +220,31 @@ export interface Bomb {
   y: number;
 }
 
+/** The mystery ship (UFO) crossing the top of the field for a bonus. `x` is
+ *  the center, `y` the top edge; `dir` is its travel direction; `bonus` is
+ *  banked when the ship is shot down. */
+export interface Mystery {
+  x: number;
+  y: number;
+  dir: 1 | -1;
+  bonus: number;
+}
+
+/** Which screen the run is on. The update only advances the simulation while
+ *  `playing`; the other three freeze the world where it stands and the
+ *  renderer overlays the matching screen. */
+export type Phase = "title" | "playing" | "paused" | "gameover";
+
+/** Sound effects the update emits for the frame loop to play. Kept as data on
+ *  the world so world.ts stays free of any audio import (and stays runnable
+ *  in a DOM-less harness). */
+export type GameEvent =
+  | "fire"
+  | "alienHit"
+  | "march"
+  | "cannonHit"
+  | "mysteryHit";
+
 export interface World {
   readonly aliens: Alien[];
   /** The four bunkers, each independently eroding where struck. */
@@ -188,10 +252,14 @@ export interface World {
   /** Cannon center-x and top-y. */
   readonly cannon: { x: number; y: number };
   /** The in-flight player shot, or null when none is on screen. The arcade
-    * allowed exactly one at a time, so firing is gated on this being null. */
+     * allowed exactly one at a time, so firing is gated on this being null. */
   shot: { x: number; y: number } | null;
   /** Alien bombs currently in flight. */
   readonly bombs: Bomb[];
+  /** The mystery ship, or null while none is crossing. */
+  mystery: Mystery | null;
+  /** Ticks until the next mystery-ship spawn. Counts down one per update. */
+  mysteryCooldown: number;
   /** Current march direction: 1 right, -1 left. */
   marchDir: 1 | -1;
   /** Ticks until the next march step. Counts down one per fixed update. */
@@ -199,14 +267,23 @@ export interface World {
   /** Current wave, starting at 1. Drives "lower and faster" on restart. */
   wave: number;
   /** Lives remaining. Reaching zero ends the run; losing any life resets the
-    * cannon to centre and clears the screen of bombs and the player's shot. */
+     * cannon to centre and clears the screen of bombs and the player's shot. */
   lives: number;
   /** Ticks until the next alien bomb may drop. Counts down one per update. */
   bombCooldown: number;
+  /** Running score for this run. */
+  score: number;
+  /** Best score seen on this device, persisted to localStorage. Beaten when
+     *  a run ends with `score` greater than it. */
+  best: number;
   /** True once the formation reaches the cannon's line OR the last life is
-    * lost. The update then freezes — the game-over screen itself is a later
-    * slice (#3); this one only stops the simulation. */
+     *  lost. Kept in lockstep with `phase === "gameover"` so existing logic
+     *  (and the smoke harness) that reads it keeps working. */
   gameOver: boolean;
+  /** Which screen is showing. The update only advances while `playing`. */
+  phase: Phase;
+  /** Sound effects emitted this update. Drained by the frame loop each step. */
+  readonly events: GameEvent[];
 }
 
 /**
@@ -257,15 +334,74 @@ export function createWorld(): World {
     cannon: { x: WORLD_W / 2, y: CANNON_TOP },
     shot: null,
     bombs: [],
+    mystery: null,
+    mysteryCooldown: nextMysteryCooldown(),
     marchDir: 1,
     stepCooldown: 0,
     wave: 0,
     lives: START_LIVES,
     bombCooldown: 0,
+    score: 0,
+    best: loadBest(),
+    // `playing` (not `title`) so a harness that calls `update` directly — the
+    // smoke test — runs the full simulation as before. The entry point sets
+    // `title` after this so the player sees the title screen on load.
     gameOver: false,
+    phase: "playing",
+    events: [],
   };
   startWave(world, 1);
   return world;
+}
+
+/**
+ * Reset an existing world in place for a fresh run: full lives, zero score,
+ * fresh bunkers, centred cannon, wave 1, playing. Rebuilding the bunkers
+ * (rather than reusing them) is why a new run starts with whole shields.
+ */
+export function resetWorld(world: World): void {
+  const shieldW = SPRITES.shield.w;
+  const slot = WORLD_W / 4;
+  for (let i = 0; i < 4; i++) {
+    world.shields[i] = makeShield(slot * i + (slot - shieldW) / 2, SHIELD_TOP);
+  }
+  world.cannon.x = WORLD_W / 2;
+  world.shot = null;
+  world.bombs.length = 0;
+  world.mystery = null;
+  world.mysteryCooldown = nextMysteryCooldown();
+  world.lives = START_LIVES;
+  world.score = 0;
+  world.gameOver = false;
+  world.phase = "playing";
+  world.events.length = 0;
+  startWave(world, 1);
+}
+
+/** Read the persisted best score, or 0 if storage is unavailable. */
+function loadBest(): number {
+  try {
+    const v = localStorage.getItem(BEST_KEY);
+    if (!v) return 0;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Persist `n` as the best score, if storage is available. */
+function saveBest(n: number): void {
+  try {
+    localStorage.setItem(BEST_KEY, String(n));
+  } catch {
+    /* storage unavailable — best just doesn't persist */
+  }
+}
+
+/** Tick count to the next mystery-ship spawn: the base interval ± jitter. */
+function nextMysteryCooldown(): number {
+  return MYSTERY_INTERVAL + Math.round((Math.random() - 0.5) * 2 * MYSTERY_JITTER);
 }
 
 /** Count aliens still alive in the formation. */
@@ -301,6 +437,10 @@ function startWave(world: World, wave: number): void {
   world.shot = null;
   world.bombs.length = 0;
   world.bombCooldown = bombInterval(FORMATION_TOTAL, wave);
+  // The mystery ship, if one was crossing when the wave was cleared, goes
+  // away with the rest of the old wave; the next one is freshly scheduled.
+  world.mystery = null;
+  world.mysteryCooldown = nextMysteryCooldown();
 }
 
 /** Clamp `v` to the closed range [lo, hi]. */
@@ -435,17 +575,29 @@ function spawnBomb(world: World): void {
 
 /**
  * Lose a life: clear the screen of bombs and the player's shot, re-centre the
- * cannon, and decrement lives. Reaching zero sets `gameOver` — the third life
- * lost ends the run. Clearing the bombs on death is the arcade's beat: the
- * explosion clears the air, so the respawn is not instantly punished by a
- * bomb that was already on top of the cannon.
+ * cannon, and decrement lives. Reaching zero ends the run — the third life
+ * lost sets `gameOver` and `phase` to "gameover" and banks the best score.
+ * Clearing the bombs on death is the arcade's beat: the explosion clears the
+ * air, so the respawn is not instantly punished by a bomb that was already on
+ * top of the cannon.
  */
 function loseLife(world: World): void {
   world.lives -= 1;
   world.bombs.length = 0;
   world.shot = null;
   world.cannon.x = WORLD_W / 2;
-  if (world.lives <= 0) world.gameOver = true;
+  world.events.push("cannonHit");
+  if (world.lives <= 0) endRun(world);
+}
+
+/** End the run: freeze the simulation and bank the best score if beaten. */
+function endRun(world: World): void {
+  world.gameOver = true;
+  world.phase = "gameover";
+  if (world.score > world.best) {
+    world.best = world.score;
+    saveBest(world.best);
+  }
 }
 
 /**
@@ -555,7 +707,9 @@ function bombSweptY(yBefore: number, yAfter: number): {
  *
  * The march runs on a tick counter (one update = one tick), decoupled from
  * `dt` so a 120 Hz display does not double its speed. The tempo rises as the
- * formation thins and again on each new wave.
+ * formation thins and again on each new wave, and each march step emits a
+ * "march" sound event — the four-note descending soundtrack therefore
+ * quickens with the formation, driven by aliens remaining, not by a timer.
  *
  * Aliens shoot back on their own cadence: only the bottom of each live column
  * drops a bomb, and at most three are in the air at once. A bomb that reaches
@@ -564,14 +718,18 @@ function bombSweptY(yBefore: number, yAfter: number): {
  * bombs erode the bunkers per-cell where they strike, and a shot and bomb that
  * meet in the air cancel, as on the arcade.
  *
- * The run also ends the moment the formation lands on the cannon's line. Once
- * `gameOver` is set the update freezes — the game-over screen itself is #3;
- * this slice only stops the simulation.
- *
- * Out of scope for this slice: score and the game-over screen (#3).
+ * Score is added when an alien is destroyed (30 / 20 / 10 by row, top down)
+ * and when the mystery ship — which occasionally crosses the top — is shot
+ * down for a random bonus. The run ends the moment the formation lands on the
+ * cannon's line; on either kind of game over the best score is banked. The
+ * update only advances while `phase === "playing"`; title, pause and game-over
+ * freeze the world where it stands, and the renderer overlays the screen.
  */
 export function update(world: World, input: InputState, dt: number): void {
-  if (world.gameOver) return; // frozen until the game-over screen (#3)
+  // Sound events are drained by the frame loop after each update, so reset
+  // the queue first — even when frozen we leave it empty.
+  world.events.length = 0;
+  if (world.phase !== "playing") return; // frozen: title / paused / gameover
 
   // 1. Cannon movement. Both directions held cancels out; the cannon is
   //    bounded by the field edges so it cannot slide off the playfield.
@@ -589,8 +747,11 @@ export function update(world: World, input: InputState, dt: number): void {
   //    request is consumed whether or not a shot spawns — a press made while
   //    a shot is in flight does nothing and is not remembered; the player
   //    must press again once that shot leaves the field or hits something.
-  if (consumeFire(input) && world.shot === null) {
-    world.shot = { x: world.cannon.x, y: CANNON_TOP - SHOT_H };
+  if (consumeFire(input)) {
+    if (world.shot === null) {
+      world.shot = { x: world.cannon.x, y: CANNON_TOP - SHOT_H };
+      world.events.push("fire");
+    }
   }
 
   // 3. Shot travel, shield erosion, alien collision. The shot moves up each
@@ -614,6 +775,12 @@ export function update(world: World, input: InputState, dt: number): void {
         const hit = findAlienHit(world, world.shot);
         if (hit) {
           hit.alive = false;
+          world.score += scoreForKind(hit.kind);
+          world.events.push("alienHit");
+          world.shot = null;
+        } else if (hitMystery(world, world.shot)) {
+          // hitMystery banked the bonus, removed the ship, and emitted the
+          // "mysteryHit" sound event; the shot is consumed either way.
           world.shot = null;
         }
       }
@@ -700,22 +867,94 @@ export function update(world: World, input: InputState, dt: number): void {
 
   // 5. March: count down one tick per update, step on zero. The next interval
   //    is recomputed from the aliens remaining after the step, so killing one
-  //    between steps speeds up the step after next.
+  //    between steps speeds up the step after next. Each step emits a "march"
+  //    sound event so the four-note loop quickens with the thinning wave.
   world.stepCooldown -= 1;
   if (world.stepCooldown <= 0) {
     marchStep(world);
     world.stepCooldown = ticksPerStep(aliveCount(world), world.wave);
+    world.events.push("march");
   }
 
   // 6. Reach: a drop may have brought the formation to the cannon's line —
   //    instant loss, regardless of lives left.
   if (reachedCannon(world)) {
-    world.gameOver = true;
+    endRun(world);
     return;
   }
 
   // 7. Next wave: a cleared formation restarts lower and faster.
   if (aliveCount(world) === 0) {
     startWave(world, world.wave + 1);
+  }
+
+  // 8. Mystery ship: tick the spawn timer, and move any ship already crossing.
+  //    The ship flies continuously (independent of the march) and is despawned
+  //    when it leaves the far side — no bonus unless it is shot down.
+  updateMystery(world, dt);
+}
+
+/** Points for destroying an alien of `kind`. Maps the row to its score. */
+function scoreForKind(kind: SpriteName): number {
+  return SCORE_BY_KIND[kind as AlienKind] ?? 0;
+}
+
+/**
+ * If the shot overlaps the mystery ship, bank its bonus into the score, remove
+ * the ship, emit a "mysteryHit" sound event, and return true. Returns false
+ * when there is no ship or the shot misses. Continuous boxes, like the alien
+ * and cannon tests.
+ */
+function hitMystery(world: World, shot: { x: number; y: number }): boolean {
+  const m = world.mystery;
+  if (!m) return false;
+  const sp = SPRITES.ufo;
+  const mx0 = m.x - sp.w / 2;
+  const mx1 = m.x + sp.w / 2;
+  const my0 = m.y;
+  const my1 = m.y + sp.h;
+  const sx0 = shot.x - SHOT_W / 2;
+  const sx1 = shot.x + SHOT_W / 2;
+  const sy0 = shot.y;
+  const sy1 = shot.y + SHOT_H;
+  if (sx1 > mx0 && sx0 < mx1 && sy1 > my0 && sy0 < my1) {
+    world.score += m.bonus;
+    world.mystery = null;
+    world.events.push("mysteryHit");
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Spawn the mystery ship when its cooldown elapses (and none is on screen),
+ * then move any crossing ship and despawn it off the far edge. The ship does
+ * not interact with shields, bombs, or the cannon — only the player's shot,
+ * which is tested in step 3 of `update` via `hitMystery`.
+ */
+function updateMystery(world: World, dt: number): void {
+  if (!world.mystery) {
+    world.mysteryCooldown -= 1;
+    if (world.mysteryCooldown <= 0) {
+      const dir: 1 | -1 = Math.random() < 0.5 ? 1 : -1;
+      const sp = SPRITES.ufo;
+      const x = dir > 0 ? -sp.w / 2 : WORLD_W + sp.w / 2;
+      const bonus =
+        MYSTERY_BONUSES[Math.floor(Math.random() * MYSTERY_BONUSES.length)];
+      world.mystery = { x, y: MYSTERY_Y, dir, bonus };
+    }
+    return;
+  }
+
+  const m = world.mystery;
+  m.x += m.dir * MYSTERY_SPEED * dt;
+  const sp = SPRITES.ufo;
+  // Despawn once the ship is fully past the far wall.
+  if (m.dir > 0 && m.x - sp.w / 2 > WORLD_W + MYSTERY_OFF_MARGIN) {
+    world.mystery = null;
+    world.mysteryCooldown = nextMysteryCooldown();
+  } else if (m.dir < 0 && m.x + sp.w / 2 < -MYSTERY_OFF_MARGIN) {
+    world.mystery = null;
+    world.mysteryCooldown = nextMysteryCooldown();
   }
 }
